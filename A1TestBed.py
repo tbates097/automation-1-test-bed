@@ -8,7 +8,38 @@ Created on Thu Mar 28 14:14:27 2024
 import automation1 as a1
 import sys
 import tkinter as tk
+import time
 from tkinter import messagebox, font
+from DecodeFaults import decode_faults
+
+fault_dict = {
+        'PositionErrorFault': 1 << 0,
+        'OverCurrentFault': 1 << 1,
+        'CwEndOfTravelLimitFault': 1 << 2,
+        'CcwEndOfTravelLimitFault': 1 << 3,
+        'CwSoftwareLimitFault': 1 << 4,
+        'CcwSoftwareLimitFault': 1 << 5,
+        'AmplifierFault': 1 << 6,
+        'FeedbackInput0Fault': 1 << 7,
+        'FeedbackInput1Fault': 1 << 8,
+        'HallSensorFault': 1 << 9,
+        'MaxVelocityCommandFault': 1 << 10,
+        'EmergencyStopFault': 1 << 11,
+        'VelocityErrorFault': 1 << 12,
+        'ExternalFault': 1 << 15,
+        'MotorTemperatureFault': 1 << 17,
+        'AmplifierTemperatureFault': 1 << 18,
+        'EncoderFault': 1 << 19,
+        'GantryMisalignmentFault': 1 << 22,
+        'FeedbackScalingFault': 1 << 23,
+        'MarkerSearchFault': 1 << 24,
+        'SafeZoneFault': 1 << 25,
+        'InPositionTimeoutFault': 1 << 26,
+        'VoltageClampFault': 1 << 27,
+        'MotorSupplyFault': 1 << 28,
+        'InternalFault': 1 << 30,
+    }
+
 
 sys.stdout = sys.__stdout__
 root = tk.Tk()
@@ -164,15 +195,15 @@ else:
 
 electrical_limits = controller.runtime.parameters.axes['X'].protection.faultmask
 electrical_limit_value = int(electrical_limits.value)
-print('Fault Mask: ',electrical_limit_value)
+#print('Fault Mask: ',electrical_limit_value)
 
 #controller.runtime.commands.calibration.calibrationload(a1.CalibrationType.AxisCalibration1D, 'my_cal.cal')
 absolute = int(controller.runtime.parameters.axes['X'].feedback.primaryfeedbacktype.value)
-print('Aux Feedback Type: ',absolute)
+#print('Aux Feedback Type: ',absolute)
 
 absolute_offset = controller.runtime.parameters.axes['X'].feedback.auxiliaryabsolutefeedbackoffset.value
 homesetup_dec_val = int(controller.runtime.parameters.axes['X'].homing.homesetup.value)
-print('Home Setup: ', homesetup_dec_val)
+#print('Home Setup: ', homesetup_dec_val)
 
 if absolute == 1:
     encoder = 'IncrementalEncoderSquareWave'
@@ -194,20 +225,70 @@ print('Axes present: ' , non_virtual_axes)
 #print('Encoder Type: ', encoder)
 #print('Cal File: ' , calibration_1d_file)
 #print('Configured Params: ' , configured_parameters)
+halls = {}
+for axis in non_virtual_axes:
+    print("Axis: ", axis)
+    data_config = a1.DataCollectionConfiguration(1000,a1.DataCollectionFrequency.Frequency1kHz)  #Freq should be 20x the max frequency required by end process
+    data_config.system.add(a1.SystemDataSignal.DataCollectionSampleTime)
+    data_config.axis.add(a1.AxisDataSignal.DriveStatus, axis)
+    data_config.axis.add(a1.AxisDataSignal.PrimaryFeedback, axis)
 
-data_config = a1.DataCollectionConfiguration(1000,a1.DataCollectionFrequency.Frequency1kHz)  #Freq should be 20x the max frequency required by end process
-data_config.system.add(a1.SystemDataSignal.DataCollectionSampleTime)
-data_config.axis.add(a1.AxisDataSignal.DriveStatus, 'X')
-data_config.axis.add(a1.AxisDataSignal.PrimaryFeedback, 'X')
+controller.runtime.data_collection.start(a1.DataCollectionMode.Snapshot, data_config)
 
-results = controller.runtime.data_collection.collect_snapshot(data_config)
+results = controller.runtime.data_collection.get_results(data_config, 1000)
 
-halls = results.axis.get(a1.AxisDataSignal.DriveStatus, 'X').points
+for axis in non_virtual_axes:
+    halls[axis] = results.axis.get(a1.AxisDataSignal.DriveStatus, axis).points
+    
+print(halls)
+#hall_a_ST1 = [1 if ((int(x) & a1.DriveStatus.HallAInput.value) > 0) else 0 for x in halls_ST1]
+#hall_b_ST1 = [1 if ((int(x) & a1.DriveStatus.HallBInput.value) > 0) else 0 for x in halls_ST1]
+#hall_c_ST1 = [1 if ((int(x) & a1.DriveStatus.HallCInput.value) > 0) else 0 for x in halls_ST1]
 
-hall_a = [1 if ((int(x) & a1.DriveStatus.HallAInput.value) > 0) else 0 for x in halls]
-hall_b = [1 if ((int(x) & a1.DriveStatus.HallBInput.value) > 0) else 0 for x in halls]
-hall_c = [1 if ((int(x) & a1.DriveStatus.HallCInput.value) > 0) else 0 for x in halls]
+#hall_a_ST2 = [1 if ((int(x) & a1.DriveStatus.HallAInput.value) > 0) else 0 for x in halls_ST2]
+#hall_b_ST2 = [1 if ((int(x) & a1.DriveStatus.HallBInput.value) > 0) else 0 for x in halls_ST2]
+#hall_c_ST2 = [1 if ((int(x) & a1.DriveStatus.HallCInput.value) > 0) else 0 for x in halls_ST2]
 
-pri_fbk = results.axis.get(a1.AxisDataSignal.PrimaryFeedback, 'X').points
+pri_fbk = results.axis.get(a1.AxisDataSignal.PrimaryFeedback, 'ST1').points
+
+# =============================================================================
+# def check_for_faults():
+#     print('Checking For Faults')
+#     faults = {}  # Initialize an empty dictionary to store results per axis
+#     #decoded_faults_per_axis = {}  # Dictionary to store decoded faults for each axis
+#     
+#     for axis in non_virtual_axes:
+#         status_item_configuration = a1.StatusItemConfiguration()
+#         status_item_configuration.axis.add(a1.AxisStatusItem.AxisFault, axis)
+#         
+#         # Get the results for the current axis
+#         results = controller.runtime.status.get_status_items(status_item_configuration)
+#         
+#         # Extract the axis fault status as an integer
+#         axis_faults = int(results.axis.get(a1.AxisStatusItem.AxisFault, axis).value)
+#         setup_axes = controller.
+#         # Store the axis_faults in the self.faults dictionary with the axis as the key
+#         faults[axis] = axis_faults  # Store the result in the dictionary with the axis as the key
+#         
+#     return faults
+# =============================================================================
+print(non_virtual_axes)
+#print('Hall a for ST1: ', hall_a_ST1)
+#print('Hall a for ST2: ', hall_a_ST2)
+
+
+# =============================================================================
+# controller.runtime.commands.motion.enable(non_virtual_axes)
+# controller.runtime.commands.motion.home(non_virtual_axes)
+# #controller.runtime.commands.motion.movefreerun(['ST1'], [10])
+# time.sleep(5)
+# 
+# faults_per_axis = check_for_faults()
+# 
+# fault_init = decode_faults(faults_per_axis, non_virtual_axes, controller)
+# fault_init.get_fault()
+# controller.runtime.commands.motion.waitformotiondone(["ST1"])
+# =============================================================================
+
 
 
