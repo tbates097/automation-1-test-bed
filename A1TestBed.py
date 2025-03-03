@@ -9,15 +9,135 @@ import automation1 as a1
 import sys
 import tkinter as tk
 import time
+import numpy as np
+import serial.tools.list_ports
 from tkinter import messagebox, font, filedialog
 from DecodeFaults import decode_faults
 import json
+import threading
 import automation1.internal.exceptions_gen as a1_exceptions  # Import Automation1 exceptions
 
+station_lock = threading.Lock()
+stations = []
+test_axes = []
+
+# Initialize hall sensor dictionaries
+hall_a = {}
+hall_b = {}
+hall_c = {}
+hall_states = {}
+hall_encoder_positions = {}
+pri_fbk = {}
+ccw_fault = {}
+cw_fault = {}
+pos_error_fault = {}
+over_current_fault = {}
+        
 controller = None
 non_virtual_axes = []
 connected_axes = {}
 controllers = {}
+
+station_dict = {
+    'ST01': '192.168.1.15',
+    'ST02': '192.168.1.16',
+    'ST03': '192.168.1.17'
+}
+
+station_states = {
+    'ST01': {
+        "status": "free",
+        "thread": None,
+        "serial_number": None,
+        "axis_name": "ST01",
+        "program_id": None,
+        "controllers": None
+    },
+    'ST02': {
+        "status": "free",
+        "thread": None,
+        "serial_number": None,
+        "axis_name": "ST02",
+        "program_id": None,
+        "controllers": None
+    },
+    'ST03': {
+        "status": "free",
+        "thread": None,
+        "serial_number": None,
+        "axis_name": "ST03",
+        "program_id": None,
+        "controllers": None
+    }
+}
+
+def allocate_stations(num_stations, program_id):
+    """Allocate the required number of free stations, or return None if not enough are available."""
+    try:
+        if not station_lock.acquire(timeout=5):
+            print("Could not acquire station lock - timeout")
+            return None
+            
+        free_stations = [
+            station for station in ['ST01', 'ST02', 'ST03']
+            if station_states[station]["status"] == "free"
+        ]
+        print(f"Found {len(free_stations)} free stations: {free_stations}")
+        
+        if len(free_stations) >= num_stations:
+            allocated = free_stations[:num_stations]
+            print(f"Allocating stations: {allocated}")
+            for station in allocated:
+                station_states[station].update({
+                    "status": "in-use",
+                    "program_id": program_id
+                })
+            return allocated
+        
+        print(f"Not enough free stations. Need {num_stations}, found {len(free_stations)}")
+        return None
+    except Exception as e:
+        print(f"Error in allocate_stations: {str(e)}")
+        return None
+    finally:
+        try:
+            station_lock.release()
+            print("Released station lock")
+        except RuntimeError:
+            pass
+
+def release_stations(stations):
+    """Release multiple stations and mark them as free."""
+    with station_lock:
+        program_id = id(threading.current_thread())
+        for station in stations:
+            if station_states[station]["program_id"] == program_id:
+                # Only release if this program owns the station
+                if station_states[station]["controllers"]:
+                    try:
+                        station_states[station]["controllers"].disconnect()
+                    except:
+                        pass
+                station_states[station].update({
+                    "status": "free",
+                    "thread": None,
+                    "serial_number": None,
+                    "program_id": None,
+                    "controllers": None
+                })
+
+def get_station_controller(station):
+    """Safely get controller for a station."""
+    program_id = id(threading.current_thread())
+    with station_lock:
+        if station_states[station]["status"] == "in-use":
+            print(f"Debug - Station {station}:")
+            print(f"  Thread ID: {program_id}")
+            print(f"  Station program_id: {station_states[station]['program_id']}")
+            print(f"  Status: {station_states[station]['status']}")
+            if station_states[station]["controllers"]:
+                return station_states[station]["controllers"]
+    return None
 
 fault_dict = {
         'PositionErrorFault': 1 << 0,
@@ -52,17 +172,200 @@ sys.stdout = sys.__stdout__
 root = tk.Tk()
 root.withdraw()
 
+def get_limit_dec(controller, axis, limit=None):
+    # Retrieve the current configuration for the axis
+    electrical_limits = controller.runtime.parameters.axes[axis].protection.faultmask
+    electrical_limit_value = int(electrical_limits.value)
+
+    # Define bit positions for each limit
+    CCW_SOFTWARE_LIMIT = 5
+    CW_SOFTWARE_LIMIT = 4
+    CCW_ELECTRICAL_LIMIT = 3
+    CW_ELECTRICAL_LIMIT = 2
+
+    # Toggle limits
+    if limit == 'software on':
+        electrical_limit_value |= (1 << CCW_SOFTWARE_LIMIT) | (1 << CW_SOFTWARE_LIMIT)
+    elif limit == 'software off':
+        electrical_limit_value &= ~((1 << CCW_SOFTWARE_LIMIT) | (1 << CW_SOFTWARE_LIMIT))
+    elif limit == 'electrical on':
+        electrical_limit_value |= (1 << CCW_ELECTRICAL_LIMIT) | (1 << CW_ELECTRICAL_LIMIT)
+    elif limit == 'electrical off':
+        electrical_limit_value &= ~((1 << CCW_ELECTRICAL_LIMIT) | (1 << CW_ELECTRICAL_LIMIT))
+
+    return electrical_limit_value
+
+def params(controller, axis, home_offset=None, current_clamp=None, limit=None):
+    """
+    Configure parameters for a specific axis on its controller.
+
+    Args:
+        controller: The controller object for this specific axis
+        axis: The axis to configure
+        home_offset (int): The home offset value for the axis
+        current_clamp (float): The maximum current clamp value
+        limit (str): The fault mask limits (e.g., 'software on', 'software off')
+    """
+    # Retrieve current configuration parameters for the axis
+    configured_parameters = controller.configuration.parameters.get_configuration()
+    
+    if home_offset:
+        home_offset_before = controller.runtime.parameters.axes[axis].homing.homeoffset.value
+        print(f'Home Offset Before: {home_offset_before}')
+        configured_parameters.axes[axis].homing.homeoffset.value = home_offset
+        home_offset_after = controller.runtime.parameters.axes[axis].homing.homeoffset.value
+        print(f'Home Offset After: {home_offset_after}')
+    if home_offset == 0:
+        home_offset_before = controller.runtime.parameters.axes[axis].homing.homeoffset.value
+        print(f'Home Offset Before: {home_offset_before}')
+        configured_parameters.axes[axis].homing.homeoffset.value = 0
+        home_offset_after = controller.runtime.parameters.axes[axis].homing.homeoffset.value
+        print(f'Home Offset After: {home_offset_after}')
+
+
+    if current_clamp:
+        current_clamp_before = controller.runtime.parameters.axes[axis].protection.maxcurrentclamp.value
+        print(f'Current Clamp Before: {current_clamp_before}')
+        configured_parameters.axes[axis].protection.limitdebouncedistance.value = 1
+        configured_parameters.axes[axis].protection.maxcurrentclamp.value = current_clamp
+        current_clamp_after = controller.runtime.parameters.axes[axis].protection.maxcurrentclamp.value
+        print(f'Current Clamp After: {current_clamp_after}')
+
+    if limit:
+        limit_before = controller.runtime.parameters.axes[axis].protection.faultmask.value
+        print(f'Limit Before: {limit_before}')
+        electrical_limit_value = get_limit_dec(controller, axis, limit)
+        configured_parameters.axes[axis].protection.faultmask.value = electrical_limit_value
+        limit_after = controller.runtime.parameters.axes[axis].protection.faultmask.value
+        print(f'Limit After: {limit_after}')
+
+    # Apply the updated configuration for the axis
+    controller.configuration.parameters.set_configuration(configured_parameters)
+
+def reset_controllers():
+    """
+    Reset all controllers in parallel using threads.
+    Waits for all resets to complete before returning.
+    """
+    global test_axes
+    threads = []
+    
+    def reset_single_controller(station):
+        if not isinstance(station, str):
+            print(f"Invalid station format: {station}")
+            return
+            
+        if station not in station_states:
+            print(f"Unknown station: {station}")
+            return
+            
+        controller = get_station_controller(station)
+        try:
+            if controller:
+                print(f"Resetting controller for station {station}")
+                controller.reset()
+                print(f"Reset completed for station {station}")
+            else:
+                print(f"No controller found for station {station}")
+            
+        except Exception as e:
+            print(f"Error resetting station {station}: {str(e)}")
+    
+    # Ensure we're working with complete station names
+    if isinstance(test_axes, str):
+        test_axes = [test_axes]  # Convert single station to list
+        
+    # Filter out any invalid stations
+    valid_stations = [station for station in test_axes if station in station_states]
+    
+    if not valid_stations:
+        print(f"No valid stations found in: {test_axes}")
+        return
+        
+    print(f"Starting reset for stations: {valid_stations}")
+    
+    # Start reset threads
+    for station in valid_stations:
+        thread = threading.Thread(target=reset_single_controller, args=(station,))
+        threads.append(thread)
+        thread.start()
+    
+    # Wait for all resets to complete
+    for thread in threads:
+        thread.join()
+    
+    # Standard wait time after reset
+    time.sleep(10)
+
+def axis_name(station):
+    """Get list of available axes for a specific station."""
+    # Get controller for the station
+    controller = get_station_controller(station)
+    if not controller:
+        print(f"No controller found for station {station}")
+        return []
+
+    non_virtual_axes = []
+    connected_axes = {}
+
+    number_of_axes = controller.runtime.parameters.axes.count
+    print(f"Number of axes for station {station}: {number_of_axes}")
+
+    if number_of_axes <= 12:
+        for axis_index in range(0, 11):
+            status_item_configuration = a1.StatusItemConfiguration()
+            status_item_configuration.axis.add(a1.AxisStatusItem.AxisStatus, axis_index)
+            
+            result = controller.runtime.status.get_status_items(status_item_configuration)
+            axis_status = int(result.axis.get(a1.AxisStatusItem.AxisStatus, axis_index).value)
+            if (axis_status & 1 << 13) > 0:
+                axis_name = controller.runtime.parameters.axes[axis_index].identification.axisname.value
+                connected_axes[axis_name] = axis_index
+                non_virtual_axes.append(axis_name)
+    
+    print(f'Axes present for station {station}: {non_virtual_axes}')
+    return non_virtual_axes
+
 def multiple_controllers():
-    global controllers
-    #try:
-    controller = a1.Controller.connect(host='10.101.3.198')
-    controller_name = controller.name
-    print('Controllers: ', controller_name)
-    controller.start()
-    running = controller.is_running
-    print('Running: ', running)
-    #except:
-        #messagebox.showerror('No Device', 'No Devices Present. Check Connections.')
+    global controller_ST01, controller_ST02, controller_ST03
+    try:
+        controller_ST01 = a1.Controller.connect(host='192.168.1.15')
+        controller_ST02 = a1.Controller.connect(host='192.168.1.16')
+        controller_ST03 = a1.Controller.connect(host='192.168.1.17')
+        controller_ST01_name = controller_ST01.name
+        controller_ST02_name = controller_ST02.name
+        controller_ST03_name = controller_ST03.name
+        print(f'Controller For Station 1: {controller_ST01_name}')
+        print(f'Controller For Station 2: {controller_ST02_name}')
+        print(f'Controller For Station 3: {controller_ST03_name}')
+        controller_ST01.start()
+        controller_ST02.start()
+        controller_ST03.start()
+        running_ST01 = controller_ST01.is_running
+        running_ST02 = controller_ST02.is_running
+        running_ST03 = controller_ST03.is_running
+        print(f'Running Station 1: {running_ST01}')
+        print(f'Running Station 2: {running_ST02}')
+        print(f'Running Station 3: {running_ST03}')
+    except:
+        messagebox.showerror('No Device', 'No Devices Present. Check Connections.')
+    
+    print(f'Station 1 Number of Axes: {controller_ST01.runtime.parameters.axes.count}')
+    print(f'Station 2 Number of Axes: {controller_ST02.runtime.parameters.axes.count}')
+    print(f'Station 3 Number of Axes: {controller_ST03.runtime.parameters.axes.count}') 
+
+def single_controller():
+    global controller
+    try:
+        controller_ST01 = a1.Controller.connect(host='192.168.1.16')
+        controller_ST01_name = controller_ST01.name
+        print(f'Controller For Station 1: {controller_ST01_name}')
+        controller_ST01.start()
+        running_ST01 = controller_ST01.is_running
+        print(f'Running Station 1: {running_ST01}')
+    except:
+        messagebox.showerror('No Device', 'No Devices Present. Check Connections.')
+
 def controller_def():
     ver = tk.Toplevel(root)
     ver.title('Connection Type')
@@ -107,8 +410,215 @@ def controller_def():
 
     return ver.result
 
+def serial_com():
+    num_readings = 5
+    dwell = 1
+    ports = list(serial.tools.list_ports.comports())
+    for port in ports:
+        print(f"Port: {port.device}, Description: {port.description}")
+    USB_port = None
+    RS232_port = None
+    for p in ports:
+        if "Silicon Labs CP210x" in p.description:
+            USB_port = p.device  # p.device contains the COM port, e.g., 'COM4'
+            break  # Stop after finding the first match
+        if "Communications Port (COM1)" in p.description:
+            RS232_port = p.device
+    print(f'RS232 Port: {RS232_port}')
+    try:
+        reading = 1
+        Xvalues = []
+        Yvalues = []
+        
+        try:
+            temp_ser = serial.Serial(RS232_port)
+            temp_ser.close()
+        except serial.SerialException as e:
+            print(f'Error: {e}')
+            try:
+                temp_ser.close()
+            except:
+                pass
+        #Start a loop that takes a collimator reading for the specified number of readings.
+        while reading <= num_readings:
+            reading = reading+1
+            # Open serial port
+            ser = serial.Serial(RS232_port, baudrate=19200, parity=serial.PARITY_NONE, stopbits=serial.STOPBITS_ONE, timeout=dwell)  # Adjust 'COM1' to your COM port
+        
+            # Write command to the serial port
+            ser.write(b'r\x0D')
+        
+            # Read response from the serial port
+            data = ser.readline().decode().strip()
+            response = data.split()
+            if response:
+                #Take data from autocollimator through RS232 port
+                measurement_type = response[0]
+
+                status = response[1]
+                vx = float(response[2])
+                vy = float(response[3])
+
+                Xvalues.append(vx)
+                Yvalues.append(vy)
+            else:
+                #Display messagebox for no data condition, close the serial port, and end the program.
+                messagebox.showerror('Collimator Error', 'No Signal From Autocollimator.')
+                root.destroy()
+                ser.close()
+                break
+            
+            ser.close()
+        
+        if len(Xvalues) == num_readings:
+            #Average X and Y values as a returnable variable
+            Xavg = np.average(Xvalues, axis=None)
+            Yavg = np.average(Yvalues, axis=None)
+            Xavg = str(round(Xavg,3))
+            Yavg = str(round(Yavg,3))
+        else:
+            pass
+
+    except serial.SerialException as e:
+        messagebox.showerror("Serial communication error:", e)
+        root.destroy()
+
+    except KeyboardInterrupt:
+        messagebox.showerror("Stop Issued","Stop Issued. Ending Program")
+        root.destroy()
+
+    if 'ser' in locals():
+        ser.close()
+    
+    return(Xavg,Yavg)
+
+def connect_to_stations():
+    global stations, test_axes
+    num_stations = 3
+    serial_number = '100000'
+    program_id = id(threading.current_thread())  # Unique identifier for this program instance
+    
+    # Try to allocate stations
+    stations = allocate_stations(num_stations, program_id)
+    if stations is None:
+        print("Not enough free stations available.")
+        return False
+
+    print(f"Successfully allocated stations {stations} for serial number {serial_number}")
+    
+    # Create controller objects for each allocated station
+    try:
+        # Try to acquire the lock with a timeout of 5 seconds
+        if not station_lock.acquire(timeout=5):
+            print("Could not acquire station lock - timeout")
+            return False
+            
+        for station in stations:
+            station_name = station_states[station]["axis_name"]
+            test_axes.append(station_name)
+            
+            if station_name in station_dict:
+                try:
+                    ip_address = station_dict[station_name]
+                    controller = a1.Controller.connect(host=ip_address)
+                    controller.start()
+                    # Store controller in station_states
+                    station_states[station].update({
+                        "status": "in-use",
+                        "controllers": controller,
+                        "program_id": program_id,
+                        "serial_number": serial_number
+                    })
+                    print(f"Successfully connected to {station_name} at {ip_address}")
+                except Exception as e:
+                    print(f"Failed to connect to {station_name}: {str(e)}")
+                    release_stations(stations)
+                    return False
+            else:
+                print(f"Station {station_name} not found in station_dict")  # Debug print
+    except Exception as e:
+        print(f"Error in connect_to_stations: {str(e)}")
+        return False
+    finally:
+        try:
+            station_lock.release()
+        except RuntimeError:
+            pass
+
+    print(f'Test Axes: {test_axes}')
+    return True
+
+def home_setup(station):
+    controller = get_station_controller(station)
+    axis = station_states[station]["axis_name"]
+    home_setup = controller.runtime.parameters.axes[axis].homing.hometype.value
+    print(f'Home Setup: {home_setup}')
+    return home_setup
+
+def home_station_thread(station):
+    """Helper function to home a single station."""
+    controller = get_station_controller(station)
+   
+    if not controller:
+        print(f"No controller found for station {station}")
+        return
+    
+    try:
+        axis_name = station_states[station]["axis_name"]
+        print(f'Axis Name: {axis_name}')
+        print(f"Starting homing sequence for {axis_name}")
+        
+        # Verify controller is running
+        if not controller.is_running:
+            print(f"Controller for {axis_name} is not running")
+            return
+
+        # Enable the axis first
+        controller.runtime.commands.motion.enable(axis_name)
+        print(f"Enabled {axis_name}")
+        
+        # Wait for axis to be enabled
+        time.sleep(1)
+        
+        # Start homing
+        print(f"Sending home command to {axis_name}")
+        controller.runtime.commands.motion.home(axis_name)
+        
+        # Wait for homing to complete with timeout
+        timeout = time.time() + 30  # 30 second timeout
+            
+    except Exception as e:
+        print(f"Error homing {axis_name}: {str(e)}")
+        # Check final status
+
+def home_stations():
+    """Home all stations simultaneously using threads."""
+    global stations, test_axes
+    threads = []
+
+    print(f"Test Axes: {test_axes}")
+    for station in stations:
+        axis_name = station_states[station]["axis_name"]
+        controller = get_station_controller(station)
+        params(controller, axis_name, home_offset=-12, current_clamp=5, limit='electrical on')
+    reset_controllers()
+    print(f"Starting homing for stations: {stations}")  # Debug print
+    
+    # Create a thread for each station
+    for station in stations:
+        thread = threading.Thread(target=home_station_thread, args=(station,))
+        threads.append(thread)
+        thread.start()
+    
+    # Wait for all homing operations to complete
+    for thread in threads:
+        thread.join()
+    
+    print("All stations have completed homing")
+
 def connect():
     global controller, non_virtual_axes, connected_axes
+    
     try:
         controller = a1.Controller.connect()
         controller.start()
@@ -179,8 +689,7 @@ def connect():
                 non_virtual_axes.append(key)
     print('Controller: ', controller.name)
     print('Axes present: ' , non_virtual_axes)
-    #except:
-        #messagebox.showerror('No Device', 'No Devices Present. Check Connections.')
+    return controller    #messagebox.showerror('No Device', 'No Devices Present. Check Connections.')
 
 def load_json():
     """Opens a file dialog to select a JSON file and loads it."""
@@ -263,6 +772,16 @@ def calibration():
 
     controller.runtime.commands.calibration.calibrationload(a1.CalibrationType.AxisCalibration1D, 'my_cal.cal')
     print('Cal File: ' , calibration_1d_file)
+    
+
+def motor_type(axis):
+    for axis in test_axes:
+        controller = get_station_controller(axis)
+        motor_type = controller.runtime.parameters.axes[axis].motor.motortype.value
+        commutation = controller.runtime.parameters.axes[axis].motor.commutationinitializationsetup.value
+        print('Motor Type: ', motor_type)
+        print('Commutation: ', commutation)
+        
 
 def limits(axis):
     electrical_limits = controller.runtime.parameters.axes[axis].protection.faultmask
@@ -304,7 +823,7 @@ def absolute_encoder():
     absolute_offset = controller.runtime.parameters.axes['ST01'].feedback.auxiliaryabsolutefeedbackoffset.value
     homesetup_dec_val = int(controller.runtime.parameters.axes['ST01'].homing.homesetup.value)
     print('Home Setup: ', homesetup_dec_val)
-
+    
     if absolute == 1:
         encoder = 'IncrementalEncoderSquareWave'
     elif absolute == 2:
@@ -320,34 +839,150 @@ def absolute_encoder():
 
     print('Absolute Offset: ', absolute_offset)
 
-def halls():
-    halls = {}
+def data_config(n: int, freq: a1.DataCollectionFrequency, axis: int) -> a1.DataCollectionConfiguration:
+    """
+    Data configurations. These are how to configure data collection parameters
+    """
+    # Create a data collection configuration with sample count and frequency
+    data_config = a1.DataCollectionConfiguration(n, freq)
 
-    data_config = a1.DataCollectionConfiguration(1000,a1.DataCollectionFrequency.Frequency1kHz)  #Freq should be 20x the max frequency required by end process
+    # Add items to collect data on the entire system
     data_config.system.add(a1.SystemDataSignal.DataCollectionSampleTime)
-    data_config.axis.add(a1.AxisDataSignal.DriveStatus, 'ST01')
-    data_config.axis.add(a1.AxisDataSignal.PrimaryFeedback, 'ST01')
 
-    controller.runtime.data_collection.start(a1.DataCollectionMode.Snapshot, data_config)
+    # Add items to collect data on the specified axis
+    data_config.axis.add(a1.AxisDataSignal.DriveStatus, axis)
+    data_config.axis.add(a1.AxisDataSignal.AxisFault, axis)
+    data_config.axis.add(a1.AxisDataSignal.PrimaryFeedback, axis)
+    data_config.axis.add(a1.AxisDataSignal.PositionFeedback, axis)
+    data_config.axis.add(a1.AxisDataSignal.CurrentCommand, axis)
+    data_config.axis.add(a1.AxisDataSignal.CurrentFeedback, axis)
+    data_config.axis.add(a1.AxisDataSignal.VelocityCommand, axis)
 
-    results = controller.runtime.data_collection.get_results(data_config, 1000)
+    return data_config
 
-    halls['ST01'] = results.axis.get(a1.AxisDataSignal.DriveStatus, 'ST01').points
-
-    pri_fbk = results.axis.get(a1.AxisDataSignal.PrimaryFeedback, 'ST01').points
-
-    print(halls)
-    for x in halls:
-        hall_a_ST1 = [1 if ((int(x) & a1.DriveStatus.HallAInput.value) > 0) else 0]
-        hall_b_ST1 = [1 if ((int(x) & a1.DriveStatus.HallBInput.value) > 0) else 0]
-        hall_c_ST1 = [1 if ((int(x) & a1.DriveStatus.HallCInput.value) > 0) else 0]
-
-        hall_a_ST2 = [1 if ((int(x) & a1.DriveStatus.HallAInput.value) > 0) else 0]
-        hall_b_ST2 = [1 if ((int(x) & a1.DriveStatus.HallBInput.value) > 0) else 0]
-        hall_c_ST2 = [1 if ((int(x) & a1.DriveStatus.HallCInput.value) > 0) else 0]
+def validate_halls(axis, hall_states, hall_encoder_positions):
+    controller = get_station_controller(axis)
+    hall_dict = {
+        0: "001",
+        60: "011",
+        120: "010",
+        180: "110",
+        240: "100",
+        300: "101",
+        }
+    sequence = []
+    # Validate State at each Angle
+    for electrical_angle, hall_state in hall_states[axis].items():
+        if hall_state == hall_dict[electrical_angle]:
+            sequence.append(hall_state)
+        else:
+            print(f"Hall state mismatch on axis {axis} at angle {electrical_angle}: {hall_state} != {hall_dict[electrical_angle]}")
     
-    print('Hall a for ST1: ', hall_a_ST1)
-    print('Hall a for ST2: ', hall_a_ST2)
+    # Validate Encoder Direction
+    start_pos = hall_encoder_positions[axis][0]
+    end_pos = hall_encoder_positions[axis][300]
+    encoder_direction = "positive" if end_pos > start_pos else "negative"
+    if encoder_direction == "negative":
+        print(f"Encoder direction mismatch on axis {axis}. Please check encoder wiring.")
+
+    # Validate Hall Sequence
+    if encoder_direction == "positive":
+        expected_order_cw = ["001", "011", "010", "110", "100", "101"]
+        if sequence == expected_order_cw:
+            print(f"Hall sequence is correct on axis {axis}")
+        else:
+            print(f"Hall sequence is incorrect on axis {axis}")
+
+    # Check Commutation Offset
+    for i, e in hall_states[axis].items():
+        if e != hall_dict[i]:
+            correct_angle = hall_dict[e]
+            commutation_offset = abs(i - correct_angle)
+            print(f"Commutation offset on axis {axis} is {commutation_offset} degrees.")
+            break
+        
+def populate(axis, results):
+    """
+    Populate the hall sensor and primary feedback data structures based on the results of a data collection run.
+    """
+    sample_rate = 1000
+    # Initialize dictionary entries for this axis with nested structure
+    if axis not in hall_states:
+        hall_states[axis] = {}
+    if axis not in hall_encoder_positions:
+        hall_encoder_positions[axis] = {}
+    
+    # Initialize other lists
+    hall_a[axis] = []
+    hall_b[axis] = []
+    hall_c[axis] = []
+    ccw_fault[axis] = []
+    cw_fault[axis] = []
+    pos_error_fault[axis] = []
+    over_current_fault[axis] = []
+    
+    # Define check points (in seconds) and corresponding electrical angles
+    check_points = [1.5, 4.5, 7.5, 10.5, 13.5, 16.5]
+    electrical_angles = [0, 60, 120, 180, 240, 300]  # degrees
+    
+    # Get the data
+    halls = results.axis.get(a1.AxisDataSignal.DriveStatus, axis).points
+    pri_fbk = results.axis.get(a1.AxisDataSignal.PrimaryFeedback, axis).points
+
+    time_array = np.array(results.system.get(a1.SystemDataSignal.DataCollectionSampleTime).points)
+    time_array -= time_array[0]
+    time_array *= .001 #msec to sec
+    time_array = time_array.tolist()
+    
+    for i, t in enumerate(time_array):
+        time_array[i] = i/sample_rate
+        
+        # Check if we're at one of our target times
+        check_time = check_points[len(hall_states[axis].keys())] if len(hall_states[axis].keys()) < len(check_points) else None
+        if check_time and abs(time_array[i] - check_time) < (1/sample_rate):
+            hall_a_data = 1 if ((int(halls[i]) & a1.DriveStatus.HallAInput.value) > 0) else 0
+            hall_b_data = 1 if ((int(halls[i]) & a1.DriveStatus.HallBInput.value) > 0) else 0
+            hall_c_data = 1 if ((int(halls[i]) & a1.DriveStatus.HallCInput.value) > 0) else 0
+            hall_state = f"{hall_a_data}{hall_b_data}{hall_c_data}"
+            current_angle = electrical_angles[len(hall_states[axis].keys())]
+            
+            # Store values with angle as key
+            hall_states[axis][current_angle] = hall_state
+            hall_encoder_positions[axis][current_angle] = pri_fbk[i]
+    
+    validate_halls(axis, hall_states, hall_encoder_positions)   
+    
+def halls(axis):
+    controller = get_station_controller(axis)
+    sample_rate = 1000
+    test_time = 22
+    n = int(sample_rate * test_time)
+    freq = a1.DataCollectionFrequency.Frequency1kHz
+        
+    angle = 0
+    current_threshold = controller.runtime.parameters.axes[axis].protection.averagecurrentthreshold.value
+    current = current_threshold / 2
+    
+    config = data_config(n, freq, axis)
+
+    controller.runtime.commands.motion.enable([axis])
+    
+    controller.runtime.data_collection.start(a1.DataCollectionMode.Snapshot, config)
+    
+    while angle < 350:
+        controller.runtime.commands.servo_loop_tuning.tuningsetmotorangle(axis, current, angle)
+        angle += 60
+        time.sleep(3)
+    
+    time.sleep(5)
+        
+    controller.runtime.data_collection.stop()
+            
+    results = controller.runtime.data_collection.get_results(config, n)
+    
+    controller.runtime.commands.motion.abort([axis])
+    controller.runtime.commands.motion.enable([axis])
+    populate(axis, results)
 
 def get_pos_fbk():
     status_item_configuration = a1.StatusItemConfiguration()
@@ -373,13 +1008,25 @@ def check_for_faults():
         
         # Extract the axis fault status as an integer
         axis_faults = int(results.axis.get(a1.AxisStatusItem.AxisFault, axis).value)
-        # Store the axis_faults in the self.faults dictionary with the axis as the key
+        # Store the axis_faults in the faults dictionary with the axis as the key
         faults[axis] = axis_faults  # Store the result in the dictionary with the axis as the key
         
     return faults
 
+def upload_mcd(station):
+    print(f'Uploading MCD for {station}')
+    controller = get_station_controller(station)
+    print(f'Controller: {controller}')
+    mdk_path = r'C:\Users\tbates\Documents\Automation1\PRO165SL.mcd'
+    controller.upload_mcd_to_controller(mdk_path, should_include_files=True, should_include_configuration=True, erase_controller=False)
+    print(f'MCD uploaded for {station}')
+
+    reset_controllers()
+       
 def main(test=None):
     """Main function to load JSON and get parameters for an axis."""
+    print(f"Starting main with test={test}")  # Debug print
+    
     if test == 'Params':
         data = load_json()
         if data:
@@ -399,4 +1046,48 @@ def main(test=None):
         test_runtime_params(data, axis='ST03', axis_index='2')
     if test == 'Multiple Controllers':
         multiple_controllers()
-main(test='Multiple Controllers')
+    if test == 'Single Controller':
+        single_controller()
+    if test == 'Connect to Stations':
+        print("Initiating station connection...")  # Debug print
+        success = connect_to_stations()
+        if success:
+            for station in stations:
+                axis_name(station)
+            print("Connection successful, proceeding to home stations...")  # Debug print
+            home_stations()
+        else:
+            print("Failed to connect to stations")  # Debug print
+    if test == 'Serial':
+        xavg, yavg = serial_com()
+        print(f'Xavg: {xavg}, Yavg: {yavg}')
+    if test == 'Upload MCD':
+        success = connect_to_stations()
+        if success:
+            for station in stations:
+                if station == 'ST03':
+                    upload_mcd(station)
+    if test == 'Motor Type':
+        success = connect_to_stations()
+        if success:
+            for station in stations:
+                motor_type(station)
+    if test == 'Home Setup':
+        success = connect_to_stations()
+        if success:
+            for station in stations:
+                if station == 'ST03':
+                    home_setup(station)
+    
+    if test == 'Halls':
+        success = connect_to_stations()
+        if success:
+            for station in stations:
+                if station == 'ST03':
+                    halls('ST03')
+
+# When running the script
+if __name__ == "__main__":
+    print("Starting program...")  # Debug print
+    main(test='Halls')
+    print("Program completed")  # Debug print
