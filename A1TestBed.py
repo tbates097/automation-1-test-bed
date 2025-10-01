@@ -507,6 +507,9 @@ def connect_to_stations():
     print(f"Successfully allocated stations {stations} for serial number {serial_number}")
     
     # Create controller objects for each allocated station
+    successful_connections = []
+    failed_stations = []
+    
     try:
         # Try to acquire the lock with a timeout of 5 seconds
         if not station_lock.acquire(timeout=5):
@@ -515,12 +518,15 @@ def connect_to_stations():
             
         for station in stations:
             station_name = station_states[station]["axis_name"]
-            test_axes.append(station_name)
             
             if station_name in station_dict:
                 try:
                     ip_address = station_dict[station_name]
-                    controller = a1.Controller.connect(host=ip_address)
+                    try:
+                        controller = a1.Controller.connect(host=ip_address)
+                    except Exception as e:
+                        controller = a1.Controller.connect()
+
                     controller.start()
                     # Store controller in station_states
                     station_states[station].update({
@@ -529,13 +535,41 @@ def connect_to_stations():
                         "program_id": program_id,
                         "serial_number": serial_number
                     })
+                    successful_connections.append(station)
+                    test_axes.append(station_name)
                     print(f"Successfully connected to {station_name} at {ip_address}")
                 except Exception as e:
                     print(f"Failed to connect to {station_name}: {str(e)}")
-                    release_stations(stations)
-                    return False
+                    # Mark this station as failed but continue trying others
+                    failed_stations.append(station)
+                    # Reset the station state back to free for this failed station
+                    station_states[station].update({
+                        "status": "free",
+                        "controllers": None,
+                        "program_id": None,
+                        "serial_number": None
+                    })
+                    continue
             else:
                 print(f"Station {station_name} not found in station_dict")  # Debug print
+                failed_stations.append(station)
+                # Reset the station state back to free for this failed station
+                station_states[station].update({
+                    "status": "free",
+                    "controllers": None,
+                    "program_id": None,
+                    "serial_number": None
+                })
+        
+        # Check if we have any successful connections
+        if not successful_connections:
+            print("No controllers could be connected. Releasing all allocated stations.")
+            release_stations(stations)
+            return False
+        elif failed_stations:
+            print(f"Successfully connected to {len(successful_connections)} stations. Failed connections: {[station_states[s]['axis_name'] for s in failed_stations]}")
+        else:
+            print(f"Successfully connected to all {len(successful_connections)} stations.")
     except Exception as e:
         print(f"Error in connect_to_stations: {str(e)}")
         return False
@@ -548,9 +582,8 @@ def connect_to_stations():
     print(f'Test Axes: {test_axes}')
     return True
 
-def home_setup(station):
-    controller = get_station_controller(station)
-    axis = station_states[station]["axis_name"]
+def home_setup(controller, axis):
+    
     home_setup = controller.runtime.parameters.axes[axis].homing.hometype.value
     print(f'Home Setup: {home_setup}')
     return home_setup
@@ -615,6 +648,14 @@ def home_stations():
         thread.join()
     
     print("All stations have completed homing")
+
+def quick_connect():
+    global controller, non_virtual_axes, connected_axes
+
+    controller = a1.Controller.connect()
+    controller.start()
+
+    return controller
 
 def connect():
     global controller, non_virtual_axes, connected_axes
@@ -775,11 +816,24 @@ def calibration():
     
 
 def motor_type(axis):
+    # Motor type mapping
+    motor_type_map = {
+        0: "ACBrushlessLinear",
+        1: "ACBrushlessRotary", 
+        2: "DCBrush",
+        3: "StepperMotor"
+    }
+    
     for axis in test_axes:
         controller = get_station_controller(axis)
-        motor_type = controller.runtime.parameters.axes[axis].motor.motortype.value
+        motor_type_value = controller.runtime.parameters.axes[axis].motor.motortype.value
         commutation = controller.runtime.parameters.axes[axis].motor.commutationinitializationsetup.value
-        print('Motor Type: ', motor_type)
+        
+        # Convert numeric value to integer and get description
+        motor_type_int = int(motor_type_value)
+        motor_type_description = motor_type_map.get(motor_type_int, f"Unknown motor type ({motor_type_int})")
+        
+        print(f'Motor Type: {motor_type_description}')
         print('Commutation: ', commutation)
         
 
@@ -1022,7 +1076,12 @@ def upload_mcd(station):
     print(f'MCD uploaded for {station}')
 
     reset_controllers()
-       
+
+def frequency_response(station):
+    controller = a1.Controller.connect()
+    controller.runtime.commands.execute('AppFrequencyResponseTriggerMultisinePlus(X, "test.fr", 20, 2000, 250, 5, TuningMeasurementType.ServoOpenLoop, 5, 1)',1)
+
+           
 def main(test=None):
     """Main function to load JSON and get parameters for an axis."""
     print(f"Starting main with test={test}")  # Debug print
@@ -1073,11 +1132,10 @@ def main(test=None):
             for station in stations:
                 motor_type(station)
     if test == 'Home Setup':
-        success = connect_to_stations()
-        if success:
-            for station in stations:
-                if station == 'ST03':
-                    home_setup(station)
+        controller = quick_connect()
+        if controller:
+            station = 'ST01'
+            home_setup(controller, station)
     
     if test == 'Halls':
         success = connect_to_stations()
@@ -1089,5 +1147,5 @@ def main(test=None):
 # When running the script
 if __name__ == "__main__":
     print("Starting program...")  # Debug print
-    main(test='Halls')
+    main(test='Home Setup')
     print("Program completed")  # Debug print
